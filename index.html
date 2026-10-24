@@ -377,6 +377,12 @@ for (const id of ['intro', 'arBtn', 'previewBtn', 'arNote', 'topBar', 'exitBtn',
 function hint(text, isError = false) { ui.hintText.textContent = text; ui.hint.classList.toggle('hidden', !text); ui.hint.classList.toggle('error', isError); }
 // show script errors on screen, since there is no console on the phone
 addEventListener('error', e => hint('Error: ' + e.message, true));
+for (const level of ['error', 'warn']) {
+  const orig = console[level].bind(console);
+  console[level] = (...args) => { orig(...args); hint(level + ': ' + args.map(String).join(' ').slice(0, 200), true); };
+}
+// ?simple starts AR without the button overlay, to rule out overlay problems on some phones
+const SIMPLE = new URLSearchParams(location.search).has('simple');
 addEventListener('unhandledrejection', e => hint('Error: ' + (e.reason && e.reason.message || e.reason), true));
 function showGameUI(on) {
   ui.intro.classList.toggle('hidden', on);
@@ -417,8 +423,8 @@ ui.arBtn.onclick = async () => {
   try {
     const session = await navigator.xr.requestSession('immersive-ar', {
       requiredFeatures: ['hit-test', 'local'],
-      optionalFeatures: ['dom-overlay', 'light-estimation'],
-      domOverlay: { root: document.getElementById('ui') },
+      optionalFeatures: SIMPLE ? [] : ['dom-overlay'],
+      ...(SIMPLE ? {} : { domOverlay: { root: document.getElementById('ui') } }),
     });
     renderer.xr.setReferenceSpaceType('local');
     await renderer.xr.setSession(session);
@@ -460,6 +466,7 @@ function placeAt(matrix) {
   if (!units.length) deployArmies();
   ui.fightBtn.disabled = false;
   hint(battleOn ? '' : 'Armies are ready. Press Start battle, then walk around to watch.');
+  if (SIMPLE && !battleOn) setTimeout(() => ui.fightBtn.onclick(), 2000);
 }
 ui.moveBtn.onclick = () => {
   if (!arMode) return;
@@ -504,7 +511,7 @@ ui.previewBtn.onclick = () => {
 
 // ---------- main loop ----------
 const clock = new THREE.Clock();
-let lastStatus = 0;
+let lastStatus = 0, drawCalls = 0;
 renderer.setAnimationLoop((time, frame) => {
   const dt = Math.min(clock.getDelta(), 0.05);
   if (frame && hitSource && !placed) {
@@ -532,10 +539,11 @@ renderer.setAnimationLoop((time, frame) => {
   if (arMode && placed && time - lastStatus > 500) {
     lastStatus = time;
     const d = new THREE.Vector3().setFromMatrixPosition(renderer.xr.getCamera().matrixWorld).distanceTo(field.position);
-    ui.status.textContent = `Field ${d.toFixed(1)} m away`;
+    ui.status.textContent = `Field ${d.toFixed(1)} m away · ${drawCalls} draws`;
     ui.status.classList.remove('hidden');
   }
   renderer.render(scene, camera);
+  drawCalls = renderer.info.render.calls;
 });
 
 addEventListener('resize', () => {
