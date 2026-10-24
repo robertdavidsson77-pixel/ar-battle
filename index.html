@@ -1,0 +1,521 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Tabletop Battle AR</title>
+<style>
+  :root { color-scheme:dark; --ink:#f5efe1; --bg:#1b1712; --panel:rgba(27,23,18,.78); --gold:#d8a64a; --blue:#4a7fd8; --red:#d0483c; }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--ink); font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; overflow:hidden; touch-action:none; }
+  canvas { display:block; }
+  #ui { position:fixed; inset:0; pointer-events:none; }
+  #ui > * { pointer-events:auto; }
+  .top { position:absolute; top:env(safe-area-inset-top,0px); left:0; right:0; padding:12px 16px; display:flex; justify-content:space-between; align-items:center; gap:8px; }
+  .score { display:flex; gap:10px; font-weight:700; font-size:15px; background:var(--panel); padding:6px 12px; border-radius:999px; }
+  .score .b { color:#8fb4ff; } .score .r { color:#ff9488; }
+  #hint { position:absolute; left:16px; right:16px; bottom:96px; text-align:center; font-size:15px; line-height:1.4; text-shadow:0 1px 3px #000; }
+  #hint span { background:var(--panel); padding:8px 14px; border-radius:12px; display:inline-block; }
+  .bar { position:absolute; left:0; right:0; bottom:env(safe-area-inset-bottom,0px); padding:16px; display:flex; justify-content:center; gap:10px; flex-wrap:wrap; }
+  button { font:inherit; font-weight:600; font-size:15px; color:var(--ink); background:var(--panel); border:1px solid rgba(255,255,255,.18); border-radius:12px; padding:12px 16px; min-height:48px; }
+  button.primary { background:var(--gold); color:#1b1712; border-color:transparent; }
+  button:disabled { opacity:.45; }
+  .hidden { display:none !important; }
+  #banner { position:absolute; top:38%; left:16px; right:16px; text-align:center; font-size:30px; font-weight:800; letter-spacing:.02em; text-shadow:0 2px 8px #000; }
+  #intro { position:absolute; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:14px; padding:24px; text-align:center; background:radial-gradient(circle at 50% 40%, #3a2d1e, #1b1712 70%); }
+  #intro h1 { margin:0; font-size:30px; color:var(--gold); }
+  #intro p { margin:0; max-width:420px; line-height:1.5; opacity:.9; }
+  #intro small { opacity:.65; max-width:420px; line-height:1.4; }
+</style>
+<script type="importmap">
+  { "imports": { "three": "./vendor/three.module.min.js" } }
+</script>
+</head>
+<body>
+<div id="ui">
+  <div id="intro">
+    <h1>⚔️ Tabletop Battle</h1>
+    <p>Find a flat surface like a kitchen counter, place the battlefield, and watch two medieval armies fight. Walk around with your phone to see the action from any angle.</p>
+    <button id="arBtn" class="primary">Checking AR support…</button>
+    <button id="previewBtn">Watch without AR</button>
+    <small id="arNote">AR needs Chrome on an Android phone with Google Play Services for AR.</small>
+  </div>
+  <div class="top hidden" id="topBar">
+    <div class="score"><span class="b">Blue <b id="blueCount">0</b></span><span class="r">Red <b id="redCount">0</b></span></div>
+    <button id="exitBtn">Exit</button>
+  </div>
+  <div id="banner" class="hidden"></div>
+  <div id="hint" class="hidden"><span id="hintText"></span></div>
+  <div class="bar hidden" id="bar">
+    <button id="moveBtn">Move field</button>
+    <button id="sizeBtn">Size: M</button>
+    <button id="speedBtn">Speed 1×</button>
+    <button id="fightBtn" class="primary">Start battle</button>
+  </div>
+</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { mergeGeometries } from './vendor/BufferGeometryUtils.js';
+import { OrbitControls } from './vendor/OrbitControls.js';
+
+// ---------- renderer / scene ----------
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.xr.enabled = true;
+document.body.prepend(renderer.domElement);
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(55, innerWidth / innerHeight, 0.01, 50);
+camera.position.set(0, 0.55, 0.75);
+
+scene.add(new THREE.HemisphereLight(0xfff4e0, 0x5a4a3a, 1.6));
+const sun = new THREE.DirectionalLight(0xffffff, 2.2);
+sun.castShadow = true;
+sun.shadow.mapSize.set(1024, 1024);
+sun.shadow.bias = -0.0005;
+scene.add(sun, sun.target);
+
+// Game world lives in "field units" (1 unit ≈ a person's height / 1.8) and is scaled into metres.
+const FIELD_W = 30, FIELD_D = 18;
+const SIZES = [['S', 0.012], ['M', 0.02], ['L', 0.032]];
+let sizeIdx = 1;
+const field = new THREE.Group();
+field.visible = false;
+scene.add(field);
+
+function applyScale() {
+  const s = SIZES[sizeIdx][1];
+  field.scale.setScalar(s);
+  const ext = 20 * s;
+  Object.assign(sun.shadow.camera, { left: -ext, right: ext, top: ext, bottom: -ext, near: 0.01, far: 60 * s });
+  sun.shadow.camera.updateProjectionMatrix();
+  updateSun();
+  ui.sizeBtn.textContent = 'Size: ' + SIZES[sizeIdx][0];
+}
+function updateSun() {
+  const s = SIZES[sizeIdx][1];
+  sun.target.position.copy(field.position);
+  sun.position.copy(field.position).add(new THREE.Vector3(8, 22, 10).multiplyScalar(s));
+  sun.target.updateMatrixWorld();
+}
+
+// Invisible floor that only shows shadows, so troops cast shadows on the real counter.
+const shadowCatcher = new THREE.Mesh(new THREE.PlaneGeometry(FIELD_W + 14, FIELD_D + 14), new THREE.ShadowMaterial({ opacity: 0.35 }));
+shadowCatcher.rotation.x = -Math.PI / 2;
+shadowCatcher.receiveShadow = true;
+field.add(shadowCatcher);
+
+// Wooden table used only in non-AR preview mode.
+const table = new THREE.Mesh(new THREE.BoxGeometry(1.6, 0.04, 1.0), new THREE.MeshStandardMaterial({ color: 0x8a5a34, roughness: 0.8 }));
+table.position.y = -0.0201;
+table.receiveShadow = true;
+table.visible = false;
+scene.add(table);
+
+// ---------- low-poly model building ----------
+function part(geo, color, x = 0, y = 0, z = 0, rx = 0, ry = 0, rz = 0) {
+  geo = geo.index ? geo.toNonIndexed() : geo;
+  geo.rotateX(rx); geo.rotateY(ry); geo.rotateZ(rz);
+  geo.translate(x, y, z);
+  const c = new THREE.Color(color), n = geo.attributes.position.count, arr = new Float32Array(n * 3);
+  for (let i = 0; i < n; i++) { arr[i * 3] = c.r; arr[i * 3 + 1] = c.g; arr[i * 3 + 2] = c.b; }
+  geo.setAttribute('color', new THREE.BufferAttribute(arr, 3));
+  delete geo.attributes.uv;
+  return geo;
+}
+const box = (w, h, d) => new THREE.BoxGeometry(w, h, d);
+const cyl = (rt, rb, h, s = 8) => new THREE.CylinderGeometry(rt, rb, h, s);
+const SKIN = 0xe2b48c, STEEL = 0xb8c0c8, DARK = 0x3b3128, WOOD = 0x7a5230;
+
+const TEAMS = {
+  blue: { main: 0x3d6fd1, dark: 0x22417f, trim: 0xe8d27a },
+  red: { main: 0xc8392c, dark: 0x7a1e16, trim: 0xe8d27a },
+};
+
+function footmanGeo(t) {
+  return mergeGeometries([
+    part(box(0.22, 0.75, 0.22), DARK, -0.13, 0.375, 0), part(box(0.22, 0.75, 0.22), DARK, 0.13, 0.375, 0),
+    part(box(0.6, 0.65, 0.34), t.main, 0, 1.08, 0),
+    part(box(0.62, 0.1, 0.36), t.trim, 0, 0.8, 0),
+    part(new THREE.SphereGeometry(0.17, 8, 6), SKIN, 0, 1.55, 0),
+    part(cyl(0.05, 0.2, 0.22, 8), STEEL, 0, 1.72, 0),
+    part(box(0.08, 0.6, 0.5), t.dark, -0.38, 1.05, 0.08),
+    part(box(0.05, 0.75, 0.06), STEEL, 0.38, 1.25, 0.2, 0.5, 0, 0),
+    part(box(0.18, 0.05, 0.08), t.trim, 0.38, 0.95, 0.05, 0.5, 0, 0),
+  ]);
+}
+function archerGeo(t) {
+  return mergeGeometries([
+    part(box(0.2, 0.75, 0.2), DARK, -0.12, 0.375, 0), part(box(0.2, 0.75, 0.2), DARK, 0.12, 0.375, 0),
+    part(box(0.52, 0.62, 0.3), t.main, 0, 1.06, 0),
+    part(box(0.54, 0.08, 0.32), WOOD, 0, 0.8, 0),
+    part(new THREE.SphereGeometry(0.16, 8, 6), SKIN, 0, 1.52, 0),
+    part(cyl(0.0, 0.2, 0.3, 8), t.dark, 0, 1.72, -0.03),
+    part(new THREE.TorusGeometry(0.42, 0.025, 4, 10, Math.PI), WOOD, 0.36, 1.15, 0.22, 0, Math.PI / 2, -Math.PI / 2),
+    part(box(0.12, 0.45, 0.12), WOOD, -0.12, 1.15, -0.22, 0.3, 0, 0),
+  ]);
+}
+function knightGeo(t) {
+  const legs = [];
+  for (const [x, z] of [[-0.2, 0.55], [0.2, 0.55], [-0.2, -0.55], [0.2, -0.55]]) legs.push(part(box(0.14, 0.75, 0.14), 0x5a3a24, x, 0.375, z));
+  return mergeGeometries([
+    ...legs,
+    part(box(0.55, 0.5, 1.45), 0x6b4529, 0, 1.0, 0),
+    part(box(0.6, 0.38, 1.1), t.main, 0, 0.95, -0.05),
+    part(box(0.28, 0.6, 0.3), 0x6b4529, 0, 1.35, 0.78, -0.5, 0, 0),
+    part(box(0.24, 0.24, 0.45), 0x6b4529, 0, 1.6, 0.98),
+    part(box(0.12, 0.5, 0.12), 0x2a1e14, 0, 1.0, -0.8, 0.6, 0, 0),
+    part(box(0.5, 0.6, 0.32), STEEL, 0, 1.55, -0.1),
+    part(box(0.52, 0.1, 0.34), t.main, 0, 1.3, -0.1),
+    part(cyl(0.16, 0.18, 0.32, 8), STEEL, 0, 2.02, -0.1),
+    part(box(0.06, 0.2, 0.14), t.trim, 0, 2.25, -0.1),
+    part(cyl(0.025, 0.05, 2.0, 6), WOOD, 0.33, 1.6, 0.55, Math.PI / 2 - 0.15, 0, 0),
+    part(box(0.07, 0.45, 0.38), t.dark, -0.3, 1.5, 0),
+  ]);
+}
+const MAT = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.75, metalness: 0.05, flatShading: true });
+const TYPES = {
+  footman: { hp: 100, dmg: 13, range: 1.1, speed: 2.0, cd: 1.0, geo: footmanGeo, radius: 0.4 },
+  archer:  { hp: 60,  dmg: 10, range: 10,  speed: 1.9, cd: 1.7, geo: archerGeo, radius: 0.38, ranged: true },
+  knight:  { hp: 170, dmg: 20, range: 1.5, speed: 3.6, cd: 1.3, geo: knightGeo, radius: 0.7 },
+};
+const GEO = {};
+for (const team of ['blue', 'red']) for (const k in TYPES) GEO[team + k] = TYPES[k].geo(TEAMS[team]);
+
+// Scenery: banners and tents behind each army, so the field reads as a battlefield.
+function camp(team, side) {
+  const t = TEAMS[team], g = new THREE.Group();
+  const tent = new THREE.Mesh(mergeGeometries([
+    part(new THREE.ConeGeometry(1.4, 1.8, 6), t.main, 0, 0.9, 0),
+    part(cyl(0.04, 0.04, 0.6, 4), WOOD, 0, 2.0, 0),
+    part(box(0.02, 0.35, 0.55), t.trim, 0, 2.15, 0.28),
+  ]), MAT);
+  tent.castShadow = true;
+  for (const z of [-5, 5]) { const c = tent.clone(); c.position.set(side * (FIELD_W / 2 + 0.5), 0, z); g.add(c); }
+  const banner = new THREE.Mesh(mergeGeometries([
+    part(cyl(0.05, 0.05, 3.2, 5), WOOD, 0, 1.6, 0),
+    part(box(0.04, 1.1, 0.8), t.main, 0, 2.6, 0.42),
+    part(box(0.05, 0.25, 0.25), t.trim, 0, 2.6, 0.42),
+  ]), MAT);
+  banner.castShadow = true;
+  banner.position.set(side * (FIELD_W / 2 - 1), 0, 0);
+  g.add(banner);
+  // scattered rocks and shrubs
+  for (let i = 0; i < 6; i++) {
+    const r = new THREE.Mesh(new THREE.DodecahedronGeometry(0.25 + Math.random() * 0.3), new THREE.MeshStandardMaterial({ color: i % 2 ? 0x8a8478 : 0x4f6b35, flatShading: true }));
+    r.position.set(side * (2 + Math.random() * 10), 0.1, (Math.random() - 0.5) * FIELD_D);
+    r.castShadow = true;
+    g.add(r);
+  }
+  return g;
+}
+field.add(camp('blue', -1), camp('red', 1));
+
+// ---------- units ----------
+let units = [], arrows = [], speed = 1, battleOn = false, battleOver = false;
+const tmp = new THREE.Vector3();
+
+function spawn(team, type, x, z) {
+  const T = TYPES[type];
+  const mesh = new THREE.Mesh(GEO[team + type], MAT);
+  mesh.castShadow = true;
+  mesh.position.set(x, 0, z);
+  mesh.rotation.y = team === 'blue' ? Math.PI / 2 : -Math.PI / 2;
+  field.add(mesh);
+  units.push({ team, type, T, mesh, hp: T.hp, cd: Math.random() * T.cd, target: null, dead: false, deadT: 0, phase: Math.random() * 6, lunge: 0 });
+}
+
+function deployArmies() {
+  for (const u of units) field.remove(u.mesh);
+  for (const a of arrows) field.remove(a.mesh);
+  units = []; arrows = [];
+  for (const [team, side] of [['blue', -1], ['red', 1]]) {
+    const jitter = () => (Math.random() - 0.5) * 0.25;
+    for (let r = 0; r < 2; r++) for (let i = 0; i < 8; i++) spawn(team, 'footman', side * (6 + r * 1.1) + jitter(), (i - 3.5) * 1.1 + jitter());
+    for (let r = 0; r < 2; r++) for (let i = 0; i < 6; i++) spawn(team, 'archer', side * (10 + r * 1.1) + jitter(), (i - 2.5) * 1.2 + jitter());
+    for (const zs of [-1, 1]) for (let i = 0; i < 3; i++) spawn(team, 'knight', side * (8 + i * 1.6), zs * 6.5 + jitter());
+  }
+  battleOn = false; battleOver = false;
+  ui.banner.classList.add('hidden');
+  ui.fightBtn.textContent = 'Start battle';
+  updateScore();
+}
+
+function updateScore() {
+  let b = 0, r = 0;
+  for (const u of units) if (!u.dead) u.team === 'blue' ? b++ : r++;
+  ui.blueCount.textContent = b; ui.redCount.textContent = r;
+  return [b, r];
+}
+
+const ARROW_GEO = mergeGeometries([part(cyl(0.02, 0.02, 0.7, 4), WOOD, 0, 0, 0, Math.PI / 2), part(new THREE.ConeGeometry(0.05, 0.14, 4), STEEL, 0, 0, 0.4, Math.PI / 2)]);
+function shoot(u, target) {
+  const from = u.mesh.position.clone().setY(1.3);
+  const to = target.mesh.position.clone().setY(0.9);
+  to.x += (Math.random() - 0.5) * 1.0; to.z += (Math.random() - 0.5) * 1.0;
+  const dist = from.distanceTo(to);
+  const mesh = new THREE.Mesh(ARROW_GEO, MAT);
+  mesh.castShadow = true;
+  field.add(mesh);
+  arrows.push({ mesh, from, to, t: 0, dur: 0.35 + dist * 0.07, arc: 0.6 + dist * 0.18, target, dmg: u.T.dmg, stuck: 0 });
+}
+
+function damage(target, dmg) {
+  if (target.dead) return;
+  target.hp -= dmg;
+  if (target.hp <= 0) { target.dead = true; target.deadT = 0; updateScore(); }
+}
+
+function step(dt) {
+  const alive = units.filter(u => !u.dead);
+  for (const u of alive) {
+    // retarget to the nearest living enemy
+    if (!u.target || u.target.dead || Math.random() < 0.02) {
+      let best = null, bd = Infinity;
+      for (const e of alive) if (e.team !== u.team) { const d = e.mesh.position.distanceToSquared(u.mesh.position); if (d < bd) { bd = d; best = e; } }
+      u.target = best;
+    }
+    u.cd -= dt;
+    u.lunge = Math.max(0, u.lunge - dt * 4);
+    const t = u.target;
+    if (!t) continue;
+    tmp.subVectors(t.mesh.position, u.mesh.position); tmp.y = 0;
+    const d = tmp.length();
+    const reach = u.T.range + u.T.radius + t.T.radius;
+    u.mesh.rotation.y = Math.atan2(tmp.x, tmp.z);
+    if (d > reach) {
+      tmp.multiplyScalar(Math.min(d - reach + 0.05, u.T.speed * dt) / d);
+      u.mesh.position.add(tmp);
+      u.phase += dt * u.T.speed * 4;
+    } else if (u.cd <= 0) {
+      u.cd = u.T.cd * (0.85 + Math.random() * 0.3);
+      if (u.T.ranged) shoot(u, t);
+      else { u.lunge = 1; if (Math.random() < 0.85) damage(t, u.T.dmg * (0.8 + Math.random() * 0.4)); }
+    }
+  }
+  // keep units from overlapping, and inside the field
+  for (let i = 0; i < alive.length; i++) {
+    const a = alive[i];
+    for (let j = i + 1; j < alive.length; j++) {
+      const b = alive[j];
+      const dx = b.mesh.position.x - a.mesh.position.x, dz = b.mesh.position.z - a.mesh.position.z;
+      const min = a.T.radius + b.T.radius, d2 = dx * dx + dz * dz;
+      if (d2 < min * min && d2 > 1e-6) {
+        const d = Math.sqrt(d2), push = (min - d) * 0.5 / d;
+        a.mesh.position.x -= dx * push; a.mesh.position.z -= dz * push;
+        b.mesh.position.x += dx * push; b.mesh.position.z += dz * push;
+      }
+    }
+    a.mesh.position.x = THREE.MathUtils.clamp(a.mesh.position.x, -FIELD_W / 2, FIELD_W / 2);
+    a.mesh.position.z = THREE.MathUtils.clamp(a.mesh.position.z, -FIELD_D / 2, FIELD_D / 2);
+  }
+  // arrows fly on an arc and hit whoever is still near the landing point
+  for (let i = arrows.length - 1; i >= 0; i--) {
+    const a = arrows[i];
+    if (a.stuck) {
+      a.stuck -= dt;
+      if (a.stuck <= 0) { field.remove(a.mesh); arrows.splice(i, 1); }
+      continue;
+    }
+    a.t += dt / a.dur;
+    const k = Math.min(a.t, 1);
+    const p = new THREE.Vector3().lerpVectors(a.from, a.to, k);
+    p.y += Math.sin(k * Math.PI) * a.arc;
+    a.mesh.lookAt(field.localToWorld(p.clone()));
+    a.mesh.position.copy(p);
+    if (a.t >= 1) {
+      const tg = a.target;
+      if (!tg.dead && tg.mesh.position.distanceTo(tmp.copy(a.to).setY(0)) < 0.6 + tg.T.radius) { damage(tg, a.dmg); field.remove(a.mesh); arrows.splice(i, 1); }
+      else { a.mesh.position.y = 0.15; a.stuck = 4; }
+    }
+  }
+}
+
+function animate(dt) {
+  for (let i = units.length - 1; i >= 0; i--) {
+    const u = units[i], m = u.mesh;
+    if (u.dead) {
+      u.deadT += dt;
+      m.rotation.z = Math.min(u.deadT * 4, Math.PI / 2) * (u.team === 'blue' ? 1 : -1);
+      m.position.y = Math.min(u.deadT * 4, Math.PI / 2) * 0.12;
+      if (u.deadT > 6) m.position.y -= (u.deadT - 6) * 0.4;
+      if (u.deadT > 8) { field.remove(m); units.splice(i, 1); }
+      continue;
+    }
+    const bob = Math.abs(Math.sin(u.phase)) * (u.type === 'knight' ? 0.18 : 0.1);
+    m.position.y = bob;
+    m.rotation.x = u.lunge * 0.35;
+  }
+}
+
+function checkVictory() {
+  if (!battleOn || battleOver) return;
+  const [b, r] = updateScore();
+  if (b === 0 || r === 0) {
+    battleOver = true;
+    ui.banner.textContent = b ? '🛡️ Blue wins!' : r ? '🛡️ Red wins!' : 'Mutual destruction';
+    ui.banner.style.color = b ? '#8fb4ff' : '#ff9488';
+    ui.banner.classList.remove('hidden');
+    ui.fightBtn.textContent = 'Rematch';
+  }
+}
+
+// ---------- UI ----------
+const ui = {};
+for (const id of ['intro', 'arBtn', 'previewBtn', 'arNote', 'topBar', 'exitBtn', 'banner', 'hint', 'hintText', 'bar', 'moveBtn', 'sizeBtn', 'speedBtn', 'fightBtn', 'blueCount', 'redCount']) ui[id] = document.getElementById(id);
+
+function hint(text) { ui.hintText.textContent = text; ui.hint.classList.toggle('hidden', !text); }
+function showGameUI(on) {
+  ui.intro.classList.toggle('hidden', on);
+  ui.topBar.classList.toggle('hidden', !on);
+  ui.bar.classList.toggle('hidden', !on);
+}
+
+ui.fightBtn.onclick = () => {
+  if (battleOver || battleOn) { deployArmies(); return; }
+  battleOn = true;
+  ui.fightBtn.textContent = 'Reset';
+  hint('');
+};
+ui.speedBtn.onclick = () => { speed = speed === 1 ? 2 : speed === 2 ? 0.5 : 1; ui.speedBtn.textContent = `Speed ${speed}×`; };
+ui.sizeBtn.onclick = () => { sizeIdx = (sizeIdx + 1) % SIZES.length; applyScale(); };
+
+// ---------- AR session ----------
+let hitSource = null, placed = false, arMode = false;
+const reticle = new THREE.Mesh(new THREE.RingGeometry(0.035, 0.045, 32).rotateX(-Math.PI / 2), new THREE.MeshBasicMaterial({ color: 0xd8a64a }));
+reticle.matrixAutoUpdate = false;
+reticle.visible = false;
+scene.add(reticle);
+// outline of where the field will go, shown under the reticle before placing
+const ghost = new THREE.LineSegments(new THREE.EdgesGeometry(new THREE.PlaneGeometry(FIELD_W, FIELD_D).rotateX(-Math.PI / 2)), new THREE.LineBasicMaterial({ color: 0xd8a64a, transparent: true, opacity: 0.8 }));
+field.add(ghost);
+
+async function initAR() {
+  let ok = false;
+  try { ok = !!navigator.xr && await navigator.xr.isSessionSupported('immersive-ar'); } catch (e) {}
+  ui.arBtn.textContent = ok ? 'Start AR' : 'AR not available here';
+  ui.arBtn.disabled = !ok;
+  if (!ok) ui.arNote.textContent = window.self !== window.top
+    ? 'AR is blocked inside this embedded viewer. Open the hosted link in Chrome on your phone to play in AR.'
+    : 'This browser does not support WebXR AR. Use Chrome on an ARCore-capable Android phone.';
+}
+
+ui.arBtn.onclick = async () => {
+  try {
+    const session = await navigator.xr.requestSession('immersive-ar', {
+      requiredFeatures: ['hit-test', 'local'],
+      optionalFeatures: ['dom-overlay', 'light-estimation'],
+      domOverlay: { root: document.getElementById('ui') },
+    });
+    renderer.xr.setReferenceSpaceType('local');
+    await renderer.xr.setSession(session);
+    arMode = true; placed = false; field.visible = false; table.visible = false; ghost.visible = true;
+    scene.background = null; controls.enabled = false; ui.moveBtn.classList.remove('hidden');
+    showGameUI(true);
+    ui.fightBtn.disabled = true;
+    hint('Slowly sweep your phone over a table or counter. Tap when the gold ring sits on the surface.');
+    const viewer = await session.requestReferenceSpace('viewer');
+    hitSource = await session.requestHitTestSource({ space: viewer });
+    session.addEventListener('select', onSelect);
+    session.addEventListener('end', () => { arMode = false; hitSource = null; reticle.visible = false; field.visible = false; showGameUI(false); hint(''); });
+  } catch (e) {
+    ui.arNote.textContent = 'Could not start AR: ' + e.message;
+  }
+};
+// taps on the overlay buttons should not also place the field
+document.getElementById('ui').addEventListener('beforexrselect', e => e.preventDefault());
+
+function onSelect() {
+  if (placed || !reticle.visible) return;
+  placeAt(reticle.matrix);
+}
+function placeAt(matrix) {
+  const pos = new THREE.Vector3(), q = new THREE.Quaternion(), s = new THREE.Vector3();
+  matrix.decompose(pos, q, s);
+  field.position.copy(pos);
+  // face the long side of the field toward the viewer
+  const cam = renderer.xr.getCamera();
+  const dx = cam.position.x - pos.x, dz = cam.position.z - pos.z;
+  field.rotation.set(0, Math.atan2(dx, dz), 0);
+  field.visible = true;
+  ghost.visible = false;
+  placed = true;
+  reticle.visible = false;
+  applyScale();
+  if (!units.length) deployArmies();
+  ui.fightBtn.disabled = false;
+  hint(battleOn ? '' : 'Armies are ready. Press Start battle, then walk around to watch.');
+}
+ui.moveBtn.onclick = () => {
+  if (!arMode) return;
+  placed = false; ghost.visible = true;
+  hint('Point at a new spot and tap to move the battlefield.');
+};
+ui.exitBtn.onclick = () => {
+  if (arMode) renderer.xr.getSession().end();
+  else { showGameUI(false); field.visible = false; table.visible = false; controls.enabled = false; }
+};
+
+// ---------- non-AR preview ----------
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 0.03, 0);
+controls.enableDamping = true;
+controls.maxPolarAngle = Math.PI / 2 - 0.05;
+controls.minDistance = 0.15; controls.maxDistance = 2;
+controls.enabled = false;
+ui.previewBtn.onclick = () => {
+  scene.background = new THREE.Color(0x2a2118);
+  field.position.set(0, 0, 0); field.rotation.set(0, 0, 0);
+  field.visible = true; ghost.visible = false; table.visible = true;
+  sizeIdx = 1; applyScale();
+  const far = innerWidth < innerHeight ? 1.8 : 1;
+  camera.position.set(0, 0.5 * far, 0.7 * far);
+  if (!units.length) deployArmies();
+  showGameUI(true);
+  ui.moveBtn.classList.add('hidden');
+  ui.fightBtn.disabled = false;
+  controls.enabled = true;
+  hint('Drag to orbit, pinch to zoom. Press Start battle.');
+};
+
+// ---------- main loop ----------
+const clock = new THREE.Clock();
+renderer.setAnimationLoop((time, frame) => {
+  const dt = Math.min(clock.getDelta(), 0.05);
+  if (frame && hitSource && !placed) {
+    const hits = frame.getHitTestResults(hitSource);
+    if (hits.length) {
+      const pose = hits[0].getPose(renderer.xr.getReferenceSpace());
+      reticle.visible = true;
+      reticle.matrix.fromArray(pose.transform.matrix);
+      if (ghost.visible) {
+        // preview the field outline at the reticle
+        const p = new THREE.Vector3().setFromMatrixPosition(reticle.matrix);
+        field.position.copy(p); applyScale(); field.visible = true;
+        units.forEach(u => u.mesh.visible = false);
+      }
+    } else reticle.visible = false;
+  }
+  if (placed || !arMode) units.forEach(u => u.mesh.visible = true);
+  if (battleOn && !battleOver) {
+    const sdt = dt * speed;
+    step(sdt);
+    checkVictory();
+  }
+  if (field.visible) animate(dt * (battleOn ? speed : 1));
+  if (controls.enabled) controls.update();
+  renderer.render(scene, camera);
+});
+
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+applyScale();
+initAR();
+</script>
+</body>
+</html>
