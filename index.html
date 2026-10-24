@@ -413,6 +413,8 @@ async function initAR() {
   let ok = false;
   try { ok = !!navigator.xr && await navigator.xr.isSessionSupported('immersive-ar'); } catch (e) {}
   ui.arBtn.textContent = ok ? 'Start AR' : 'AR not available here';
+  // shadows are the main thing this scene does beyond three.js's own AR samples, so leave them off on AR phones
+  if (ok && !new URLSearchParams(location.search).has('shadows')) { renderer.shadowMap.enabled = false; sun.castShadow = false; shadowCatcher.visible = false; }
   ui.arBtn.disabled = !ok;
   if (!ok) ui.arNote.textContent = window.self !== window.top
     ? 'AR is blocked inside this embedded viewer. Open the hosted link in Chrome on your phone to play in AR.'
@@ -547,6 +549,7 @@ renderer.setAnimationLoop((time, frame) => {
 });
 
 addEventListener('resize', () => {
+  if (renderer.xr.isPresenting) return;
   camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix();
   renderer.setSize(innerWidth, innerHeight);
 });
