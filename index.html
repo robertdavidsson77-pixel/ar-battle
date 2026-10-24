@@ -13,9 +13,12 @@
   .top { position:absolute; top:env(safe-area-inset-top,0px); left:0; right:0; padding:12px 16px; display:flex; justify-content:space-between; align-items:center; gap:8px; }
   .score { display:flex; gap:10px; font-weight:700; font-size:15px; background:var(--panel); padding:6px 12px; border-radius:999px; }
   .score .b { color:#8fb4ff; } .score .r { color:#ff9488; }
-  #hint { position:absolute; left:16px; right:16px; bottom:96px; text-align:center; font-size:15px; line-height:1.4; text-shadow:0 1px 3px #000; }
+  #bottom { position:absolute; left:0; right:0; bottom:env(safe-area-inset-bottom,0px); padding:16px; display:flex; flex-direction:column; align-items:center; gap:10px; }
+  #hint { text-align:center; font-size:15px; line-height:1.4; text-shadow:0 1px 3px #000; }
+  #hint.error span { background:#7a1e16; }
+  #status { font-size:13px; opacity:.85; background:var(--panel); padding:6px 10px; border-radius:999px; }
   #hint span { background:var(--panel); padding:8px 14px; border-radius:12px; display:inline-block; }
-  .bar { position:absolute; left:0; right:0; bottom:env(safe-area-inset-bottom,0px); padding:16px; display:flex; justify-content:center; gap:10px; flex-wrap:wrap; }
+  .bar { display:flex; justify-content:center; gap:10px; flex-wrap:wrap; }
   button { font:inherit; font-weight:600; font-size:15px; color:var(--ink); background:var(--panel); border:1px solid rgba(255,255,255,.18); border-radius:12px; padding:12px 16px; min-height:48px; }
   button.primary { background:var(--gold); color:#1b1712; border-color:transparent; }
   button:disabled { opacity:.45; }
@@ -41,15 +44,19 @@
   </div>
   <div class="top hidden" id="topBar">
     <div class="score"><span class="b">Blue <b id="blueCount">0</b></span><span class="r">Red <b id="redCount">0</b></span></div>
+    <span id="status" class="hidden"></span>
     <button id="exitBtn">Exit</button>
   </div>
   <div id="banner" class="hidden"></div>
+  <div id="bottom">
   <div id="hint" class="hidden"><span id="hintText"></span></div>
   <div class="bar hidden" id="bar">
+    <button id="placeHereBtn" class="hidden">Place in front of me</button>
     <button id="moveBtn">Move field</button>
     <button id="sizeBtn">Size: M</button>
     <button id="speedBtn">Speed 1×</button>
     <button id="fightBtn" class="primary">Start battle</button>
+  </div>
   </div>
 </div>
 
@@ -365,9 +372,12 @@ function checkVictory() {
 
 // ---------- UI ----------
 const ui = {};
-for (const id of ['intro', 'arBtn', 'previewBtn', 'arNote', 'topBar', 'exitBtn', 'banner', 'hint', 'hintText', 'bar', 'moveBtn', 'sizeBtn', 'speedBtn', 'fightBtn', 'blueCount', 'redCount']) ui[id] = document.getElementById(id);
+for (const id of ['intro', 'arBtn', 'previewBtn', 'arNote', 'topBar', 'exitBtn', 'banner', 'hint', 'hintText', 'bar', 'moveBtn', 'sizeBtn', 'speedBtn', 'fightBtn', 'blueCount', 'redCount', 'placeHereBtn', 'status']) ui[id] = document.getElementById(id);
 
-function hint(text) { ui.hintText.textContent = text; ui.hint.classList.toggle('hidden', !text); }
+function hint(text, isError = false) { ui.hintText.textContent = text; ui.hint.classList.toggle('hidden', !text); ui.hint.classList.toggle('error', isError); }
+// show script errors on screen, since there is no console on the phone
+addEventListener('error', e => hint('Error: ' + e.message, true));
+addEventListener('unhandledrejection', e => hint('Error: ' + (e.reason && e.reason.message || e.reason), true));
 function showGameUI(on) {
   ui.intro.classList.toggle('hidden', on);
   ui.topBar.classList.toggle('hidden', !on);
@@ -417,10 +427,11 @@ ui.arBtn.onclick = async () => {
     showGameUI(true);
     ui.fightBtn.disabled = true;
     hint('Slowly sweep your phone over a table or counter. Tap when the gold ring sits on the surface.');
+    ui.placeHereBtn.classList.remove('hidden');
     const viewer = await session.requestReferenceSpace('viewer');
     hitSource = await session.requestHitTestSource({ space: viewer });
     session.addEventListener('select', onSelect);
-    session.addEventListener('end', () => { arMode = false; hitSource = null; reticle.visible = false; field.visible = false; showGameUI(false); hint(''); });
+    session.addEventListener('end', () => { arMode = false; ui.status.classList.add('hidden'); ui.placeHereBtn.classList.add('hidden'); hitSource = null; reticle.visible = false; field.visible = false; showGameUI(false); hint(''); });
   } catch (e) {
     ui.arNote.textContent = 'Could not start AR: ' + e.message;
   }
@@ -437,12 +448,13 @@ function placeAt(matrix) {
   matrix.decompose(pos, q, s);
   field.position.copy(pos);
   // face the long side of the field toward the viewer
-  const cam = renderer.xr.getCamera();
-  const dx = cam.position.x - pos.x, dz = cam.position.z - pos.z;
+  const camPos = new THREE.Vector3().setFromMatrixPosition(renderer.xr.getCamera().matrixWorld);
+  const dx = camPos.x - pos.x, dz = camPos.z - pos.z;
   field.rotation.set(0, Math.atan2(dx, dz), 0);
   field.visible = true;
-  ghost.visible = false;
+  ghost.material.opacity = 0.35;
   placed = true;
+  ui.placeHereBtn.classList.add('hidden');
   reticle.visible = false;
   applyScale();
   if (!units.length) deployArmies();
@@ -451,8 +463,17 @@ function placeAt(matrix) {
 }
 ui.moveBtn.onclick = () => {
   if (!arMode) return;
-  placed = false; ghost.visible = true;
+  placed = false; ghost.visible = true; ghost.material.opacity = 0.8;
+  ui.placeHereBtn.classList.remove('hidden');
   hint('Point at a new spot and tap to move the battlefield.');
+};
+// fallback when the surface isn't detected: put the field just ahead of and below the phone
+ui.placeHereBtn.onclick = () => {
+  const cam = renderer.xr.getCamera();
+  const camPos = new THREE.Vector3().setFromMatrixPosition(cam.matrixWorld);
+  const fwd = new THREE.Vector3(0, 0, -1).transformDirection(cam.matrixWorld).setY(0).normalize();
+  const p = camPos.clone().addScaledVector(fwd, 0.6); p.y -= 0.35;
+  placeAt(new THREE.Matrix4().makeTranslation(p.x, p.y, p.z));
 };
 ui.exitBtn.onclick = () => {
   if (arMode) renderer.xr.getSession().end();
@@ -483,6 +504,7 @@ ui.previewBtn.onclick = () => {
 
 // ---------- main loop ----------
 const clock = new THREE.Clock();
+let lastStatus = 0;
 renderer.setAnimationLoop((time, frame) => {
   const dt = Math.min(clock.getDelta(), 0.05);
   if (frame && hitSource && !placed) {
@@ -507,6 +529,12 @@ renderer.setAnimationLoop((time, frame) => {
   }
   if (field.visible) animate(dt * (battleOn ? speed : 1));
   if (controls.enabled) controls.update();
+  if (arMode && placed && time - lastStatus > 500) {
+    lastStatus = time;
+    const d = new THREE.Vector3().setFromMatrixPosition(renderer.xr.getCamera().matrixWorld).distanceTo(field.position);
+    ui.status.textContent = `Field ${d.toFixed(1)} m away`;
+    ui.status.classList.remove('hidden');
+  }
   renderer.render(scene, camera);
 });
 
